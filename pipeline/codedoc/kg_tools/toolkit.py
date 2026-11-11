@@ -12,6 +12,7 @@ from codedoc.kg_tools.utils import (
     _cypher_escape,
     _format_rows,
     _is_read_only,
+    format_chain,
 )
 from codedoc.kg_tools.registry import ToolRegistry
 
@@ -53,6 +54,345 @@ class ReverseEngineerToolkit:
         self._register_all_tools()
 
     # ── Exploration Tools ───────────────────────────────────────────────────
+
+    # ── Outbound HTTP calls (ExternalApi / CALLS_EXTERNAL) ──────────────────
+
+    _MAX_REACH_ORIGINS = 60
+    _MAX_REACH_DEPTH = 6
+
+    def _http_entry_points(self) -> dict[str, str]:
+        """Map entry-point node id -> 'METHOD /path' for every pre-computed HTTP workflow."""
+        try:
+            rows = self.backend.execute(
+                "MATCH (w:Workflow) WHERE w.entryPointId IS NOT NULL "
+                "RETURN w.entryPointId AS id, w.httpMethod AS method, w.httpPath AS path"
+            )
+        except Exception:
+            return {}
+        entries: dict[str, str] = {}
+        for r in rows or []:
+            label = " ".join(part for part in (str(r.get("method") or ""), str(r.get("path") or "")) if part)
+            if r.get("id") and label:
+                entries[str(r["id"])] = label
+
+        # Workflows only exist for traces that end in a repository/event terminal, so also
+        # treat every HTTP-mapped controller method as an entry point.
+        try:
+            mapped = self.backend.execute(
+                "MATCH (c)-[:CONTAINS]->(m)-[h:HAS_ANNOTATION]->(a:AnnotationType) "
+                "WHERE label(m) <> 'Class' AND a.name =~ '(?i).*(Get|Post|Put|Delete|Patch|Request)Mapping' "
+                "RETURN m.id AS id, c.id AS class_id, a.name AS ann, h.value AS path"
+            )
+            prefixes = {
+                str(r["id"]): str(r.get("path") or "").strip('"')
+                for r in self.backend.execute(
+                    "MATCH (c)-[h:HAS_ANNOTATION]->(a:AnnotationType) WHERE a.name = 'RequestMapping' "
+                    "RETURN c.id AS id, h.value AS path"
+                ) or []
+            }
+        except Exception:
+            mapped, prefixes = [], {}
+        for r in mapped or []:
+            node_id = str(r.get("id") or "")
+            if not node_id or node_id in entries:
+                continue
+            verb = re.sub(r"(?i)mapping$", "", str(r.get("ann") or "")).upper()
+            verb = "" if verb == "REQUEST" else verb
+            path = prefixes.get(str(r.get("class_id") or ""), "").rstrip("/") + "/" + str(r.get("path") or "").strip('"').lstrip("/")
+            entries[node_id] = " ".join(part for part in (verb, path.rstrip("/") or "/") if part)
+        return entries
+
+    def _entry_points_reaching(self, origin_id: str, entries: dict[str, str]) -> dict[str, list[str]]:
+        """Best-effort reverse BFS over CALLS.
+
+        Returns {entry-point id: [entry id, ..., origin id]} for every HTTP entry point that can
+        reach `origin_id` (shortest chain first).
+        """
+        if not entries:
+            return {}
+        parent: dict[str, str] = {}  # caller id -> the callee it was discovered from
+        visited = {origin_id}
+        frontier = [origin_id]
+        found: list[str] = [origin_id] if origin_id in entries else []
+        for _ in range(self._MAX_REACH_DEPTH):
+            if not frontier:
+                break
+            next_frontier: list[str] = []
+            for i in range(0, len(frontier), 50):
+                # `IN [...]` on untyped nodes returns wrong rows in Kuzu; OR-joined equality is correct.
+                chunk = frontier[i:i + 50]
+                # Callees whose argument types the parser could not resolve are stored as `name(?)`.
+                alias = {f"{n.split('(', 1)[0]}(?)": n for n in chunk if "(" in n}
+                targets = chunk + [a for a in alias if a not in chunk]
+                cond = " OR ".join(f"b.id = '{_cypher_escape(n)}'" for n in targets)
+                try:
+                    rows = self.backend.execute(
+                        f"MATCH (a)-[c:CALLS]->(b) WHERE {cond} RETURN DISTINCT a.id AS src, b.id AS dst"
+                    )
+                except Exception:
+                    rows = []
+                for r in rows or []:
+                    src, dst = r.get("src"), r.get("dst")
+                    dst = alias.get(dst, dst)
+                    if not src or not dst or src in visited:
+                        continue
+                    visited.add(src)
+                    parent[src] = dst
+                    next_frontier.append(src)
+                    if src in entries:
+                        found.append(src)
+            frontier = next_frontier
+            if len(visited) > 3000:
+                break
+        chains: dict[str, list[str]] = {}
+        for entry_id in found:
+            chain = [entry_id]
+            while chain[-1] != origin_id and chain[-1] in parent and len(chain) < 20:
+                chain.append(parent[chain[-1]])
+            chains[entry_id] = chain
+        return chains
+
+    def outbound_api_calls(self) -> list[dict]:
+        """Structured outbound HTTP calls, one dict per distinct ExternalApi endpoint.
+
+        Keys: method, url, host, client, language, confidence, callers (list of
+        {caller, type, path, line}), entry_points (HTTP entry points that can reach a caller),
+        flows (up to 8 {entry, entry_id, chain}; chain is node ids from entry point down to the caller).
+        Returns [] when the graph has no outbound-call data (older index or none detected).
+        """
+        cached = getattr(self, "_outbound_cache", None)
+        if cached is not None:
+            return cached
+        result = self._compute_outbound_api_calls()
+        self._outbound_cache = result
+        return result
+
+    _OUTBOUND_BASE_COLUMNS = (
+        "a.id AS api_id, a.httpMethod AS method, a.url AS url, a.host AS host, "
+        "a.client AS client, a.language AS language, m.id AS caller_id, "
+        "m.qualifiedName AS caller, label(m) AS caller_type, m.path AS path, "
+        "e.lineNumber AS line, e.confidence AS confidence"
+    )
+    _OUTBOUND_PAYLOAD_COLUMNS = (
+        ", e.requestType AS request_type, e.responseType AS response_type, "
+        "e.params AS params, e.requestHeaders AS req_headers"
+    )
+
+    def _fetch_outbound_rows(self) -> list[dict]:
+        tail = " ORDER BY a.host, a.url, m.qualifiedName LIMIT 2000"
+        for columns in (self._OUTBOUND_BASE_COLUMNS + self._OUTBOUND_PAYLOAD_COLUMNS, self._OUTBOUND_BASE_COLUMNS):
+            try:
+                return self.backend.execute(f"MATCH (m)-[e:CALLS_EXTERNAL]->(a:ExternalApi) RETURN {columns}{tail}") or []
+            except Exception:
+                continue  # indexes built before request/response capture lack the payload columns
+        return []
+
+    def _compute_outbound_api_calls(self) -> list[dict]:
+        rows = self._fetch_outbound_rows()
+        if not rows:
+            return []
+
+        entries = self._http_entry_points()
+        reach_cache: dict[str, dict[str, list[str]]] = {}
+        apis: dict[str, dict] = {}
+        for r in rows:
+            api = apis.setdefault(
+                str(r.get("api_id")),
+                {
+                    "method": r.get("method") or "UNKNOWN",
+                    "url": r.get("url") or "",
+                    "host": r.get("host") or "(unknown)",
+                    "client": r.get("client") or "",
+                    "language": r.get("language") or "",
+                    "confidence": r.get("confidence"),
+                    "callers": [],
+                    "entry_points": [],
+                    "flows": [],
+                    "_caller_ids": set(),
+                    "_request_type": None,
+                    "_response_type": None,
+                    "_params": [],
+                    "_headers": [],
+                },
+            )
+            api["_request_type"] = api["_request_type"] or r.get("request_type") or None
+            api["_response_type"] = api["_response_type"] or r.get("response_type") or None
+            for key, field in (("_params", "params"), ("_headers", "req_headers")):
+                for item in str(r.get(field) or "").split(","):
+                    if item and item not in api[key]:
+                        api[key].append(item)
+            caller_id = str(r.get("caller_id") or "")
+            if caller_id in api["_caller_ids"]:
+                continue
+            api["_caller_ids"].add(caller_id)
+            api["callers"].append(
+                {
+                    "caller": r.get("caller") or caller_id,
+                    "type": r.get("caller_type") or "",
+                    "path": r.get("path") or "",
+                    "line": r.get("line"),
+                }
+            )
+            if caller_id and caller_id not in reach_cache and len(reach_cache) < self._MAX_REACH_ORIGINS:
+                reach_cache[caller_id] = self._entry_points_reaching(caller_id, entries)
+            for entry_id, chain in reach_cache.get(caller_id, {}).items():
+                label = entries[entry_id]
+                if label not in api["entry_points"]:
+                    api["entry_points"].append(label)
+                if len(api["flows"]) < 8:
+                    api["flows"].append({"entry": label, "entry_id": entry_id, "chain": chain})
+        result = []
+        shape_cache: dict[str, dict | None] = {}
+        for api in apis.values():
+            api.pop("_caller_ids", None)
+            api["contract"] = {
+                "request": self._resolve_type_shape(api.pop("_request_type"), shape_cache),
+                "response": self._resolve_type_shape(api.pop("_response_type"), shape_cache),
+                "params": self._merge_url_params(api["url"], api.pop("_params")),
+                "headers": api.pop("_headers"),
+            }
+            result.append(api)
+        return result
+
+    # ── Request / response contracts ────────────────────────────────────────
+
+    _SCALAR_TYPES = frozenset(
+        "string str int integer long short byte double float number boolean bool char character object any unknown "
+        "void bigdecimal biginteger date localdate localdatetime localtime offsetdatetime zoneddatetime instant "
+        "duration uuid map hashmap jsonnode bytes byte[] file url uri set sequence".split()
+    )
+    _COLLECTION_TYPES = frozenset(
+        "list set collection iterable arraylist linkedlist page slice stream array".split()
+    )
+    _CLASS_LABELS = ("Class", "Record", "DataClass", "Interface", "TypeAlias")
+    _MAX_SHAPE_FIELDS = 25
+    _MAX_SHAPE_DEPTH = 12  # safety net; recursive types stop earlier via the `seen` guard
+
+    @staticmethod
+    def _merge_url_params(url: str, declared: list[str]) -> list[str]:
+        """Declared `kind:name` params plus path variables and query keys visible in the URL."""
+        merged = list(declared)
+        path = re.sub(r"^[a-zA-Z][\w+.-]*://[^/?#]*", "", url or "")
+        path_part, _, query = path.partition("?")
+        for name in re.findall(r"\{([A-Za-z_][\w]*)\}", path_part):
+            merged.append(f"path:{name}")
+        for pair in query.split("&"):
+            key = pair.split("=", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][\w.\[\]-]*", key):
+                merged.append(f"query:{key}")
+        seen, out = set(), []
+        for item in merged:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    @classmethod
+    def _peel_type(cls, text: str) -> tuple[str, bool]:
+        """`List<Vet>` -> ('Vet', True); `Owner[]` -> ('Owner', True); `Owner` -> ('Owner', False)."""
+        text = (text or "").strip()
+        is_list = False
+        for _ in range(4):
+            if text.endswith("[]"):
+                text, is_list = text[:-2].strip(), True
+                continue
+            m = re.fullmatch(r"([\w.]+)\s*<(.*)>", text)
+            if not m:
+                break
+            base = m.group(1).rsplit(".", 1)[-1]
+            inner = m.group(2).strip()
+            if base.lower() in {"map", "hashmap"}:
+                return "Map", is_list
+            if base.lower() in cls._COLLECTION_TYPES:
+                is_list = True
+            elif base.lower() in {"optional", "mono", "flux", "responseentity", "future", "completablefuture"}:
+                pass
+            else:
+                text = base  # user generic such as ApiResponse<Owner>: describe the wrapper itself
+                break
+            text = inner
+        return text.rsplit(".", 1)[-1], is_list
+
+    def _class_fields(self, name: str) -> list[dict] | None:
+        """Instance fields (name, type) of an internal class/record/interface called `name`, or None."""
+        safe = _cypher_escape(name)
+        for label in self._CLASS_LABELS:
+            try:
+                found = self.backend.execute(
+                    f"MATCH (c:{label}) WHERE c.name = '{safe}' AND (c.external IS NULL OR c.external = false) "
+                    "RETURN c.id AS id, c.qualifiedName AS qn LIMIT 1"
+                )
+            except Exception:
+                continue
+            if not found:
+                continue
+            fields = self._fields_of(label, str(found[0].get("id") or ""), str(found[0].get("qn") or ""))
+            return fields[: self._MAX_SHAPE_FIELDS] if fields is not None else None
+        return None
+
+    def _fields_of(self, label: str, node_id: str, qualified_name: str) -> list[dict] | None:
+        """Fields by qualified-name prefix (works for Java records, whose CONTAINS edge is not stored), else CONTAINS."""
+        columns = "f.name AS name, f.type AS type, f.isStatic AS static ORDER BY f.name"
+        rows: list[dict] = []
+        if qualified_name:
+            prefix = f"field:{qualified_name}."
+            try:
+                candidates = self.backend.execute(
+                    f"MATCH (f:Field) WHERE f.id STARTS WITH '{_cypher_escape(prefix)}' "
+                    f"RETURN f.id AS id, {columns}"
+                ) or []
+                rows = [r for r in candidates if "." not in str(r.get("id", ""))[len(prefix):]]
+            except Exception:
+                rows = []
+        if not rows and node_id:
+            try:
+                rows = self.backend.execute(
+                    f"MATCH (c:{label} {{id: '{_cypher_escape(node_id)}'}})-[:CONTAINS]->(f:Field) RETURN {columns}"
+                ) or []
+            except Exception:
+                return None
+        return [
+            {"name": str(r["name"]), "type": str(r.get("type") or "")}
+            for r in rows
+            if r.get("name") and not r.get("static") and r["name"] != "serialVersionUID"
+        ]
+
+    def _shape_fields(self, type_name: str, depth: int, seen: frozenset[str], cache: dict) -> list[dict] | None:
+        key = f"{type_name}@{depth}@{','.join(sorted(seen))}"
+        if key in cache:
+            return cache[key]
+        fields = self._class_fields(type_name)
+        if fields is not None and depth > 0:
+            for f in fields:
+                inner, is_list = self._peel_type(f["type"])
+                if inner.lower() in self._SCALAR_TYPES or inner in seen or inner == type_name:
+                    continue
+                nested = self._shape_fields(inner, depth - 1, seen | {type_name}, cache)
+                if nested:
+                    f["fields"] = nested
+                    f["list"] = is_list
+        cache[key] = fields
+        return fields
+
+    def _resolve_type_shape(self, type_text: str | None, cache: dict) -> dict | None:
+        """{type, list, fields: [{name, type, fields?}], inline} for a captured payload type.
+
+        `{a,b.c}` (JS object-literal / usage-inferred) becomes an inline shape; a class name is
+        resolved against the graph (every nested level). Unresolvable names keep `fields` empty.
+        """
+        text = (type_text or "").strip()
+        if not text:
+            return None
+        if text.startswith("{") and text.endswith("}"):
+            names = [n.strip() for n in text[1:-1].split(",") if n.strip()]
+            return {"type": "object", "list": False, "inline": True, "fields": [{"name": n, "type": ""} for n in names]}
+        base, is_list = self._peel_type(text)
+        shape = {"type": base, "list": is_list, "inline": False, "fields": []}
+        if base.lower() in self._SCALAR_TYPES:
+            return shape
+        fields = self._shape_fields(base, self._MAX_SHAPE_DEPTH - 1, frozenset(), cache)
+        shape["fields"] = fields or []
+        return shape
 
     def _register_all_tools(self):
         reg = self.registry
@@ -1398,7 +1738,28 @@ class ReverseEngineerToolkit:
                     f"RETURN s.step AS step, n.name AS node, n.qualifiedName AS qualifiedName "
                     f"ORDER BY s.step"
                 )
-                return _format_rows(rows) if rows else f"Workflow '{workflow_name}' not found."
+                if not rows:
+                    return f"Workflow '{workflow_name}' not found."
+                text = _format_rows(rows)
+                try:
+                    entry = backend.execute(
+                        f"MATCH (w:Workflow) WHERE w.name = '{esc}' RETURN w.entryPointId AS id LIMIT 1"
+                    )
+                    entry_id = str(entry[0].get("id") or "") if entry else ""
+                    hops = []
+                    for api in self.outbound_api_calls() if entry_id else []:
+                        for flow in api["flows"]:
+                            if flow["entry_id"] == entry_id:
+                                hops.append(f"  {format_chain(flow['chain'])} → {api['method']} {api['url']}  [{api['client']}]")
+                    if hops:
+                        text += (
+                            "\n\nOutbound HTTP calls made while handling this workflow "
+                            "(add the remote host as a sequence-diagram participant):\n"
+                            + "\n".join(dict.fromkeys(hops))
+                        )
+                except Exception:
+                    pass
+                return text
             except Exception as e:
                 return f"Error: {e}"
 
@@ -2052,6 +2413,62 @@ class ReverseEngineerToolkit:
                     lines.append("  No external dependencies marked in the graph.")
             except Exception as e:
                 lines.append(f"  (error: {e})")
+
+            try:
+                hosts: dict[str, int] = {}
+                for api in self.outbound_api_calls():
+                    hosts[api["host"]] = hosts.get(api["host"], 0) + 1
+                if hosts:
+                    lines.append("\n── Outbound HTTP hosts (call get_outbound_api_calls for detail) ──")
+                    for host, count in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+                        lines.append(f"  {host}  ({count} endpoint{'s' if count != 1 else ''})")
+            except Exception:
+                pass
+            return "\n".join(lines)
+
+        # ------------------------------------------------------------------ #
+        # get_outbound_api_calls
+        # ------------------------------------------------------------------ #
+        @reg.tool()
+        def get_outbound_api_calls() -> str:
+            """List outbound HTTP calls this code makes to remote services (RestTemplate, WebClient,
+            Feign, OkHttp, axios, fetch, HttpService, ...), grouped by remote host, with the calling
+            code and the inbound HTTP entry points that can reach each call. Use it to document
+            external systems, integrations and the outbound hops of business journeys."""
+            apis = self.outbound_api_calls()
+            if not apis:
+                return "No outbound HTTP calls detected."
+            by_host: dict[str, list[dict]] = {}
+            for api in apis:
+                by_host.setdefault(api["host"], []).append(api)
+            lines = [f"=== OUTBOUND API CALLS ({len(apis)} endpoints across {len(by_host)} hosts) ===\n"]
+            for host, items in sorted(by_host.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                lines.append(f"── {host} ({len(items)} endpoint{'s' if len(items) != 1 else ''}) ──")
+                for api in items[:15]:
+                    lines.append(f"  {api['method']} {api['url']}  [{api['client']}, {api['language']}]")
+                    for caller in api["callers"][:4]:
+                        where = f" ({caller['path']}:{caller['line']})" if caller.get("path") and caller.get("line") else ""
+                        lines.append(f"    called from {caller['type']} {caller['caller']}{where}")
+                    if len(api["callers"]) > 4:
+                        lines.append(f"    ... and {len(api['callers']) - 4} more callers")
+                    for flow in api["flows"][:3]:
+                        lines.append(f"    flow: {flow['entry']}: {format_chain(flow['chain'])} → {api['method']} {api['host']}")
+                    contract = api.get("contract") or {}
+                    for label, key in (("request", "request"), ("response", "response")):
+                        shape = contract.get(key)
+                        if shape:
+                            names = ", ".join(f["name"] for f in shape["fields"]) or "fields unknown"
+                            lines.append(f"    {label}: {'List<' + shape['type'] + '>' if shape['list'] else shape['type']} ({names})")
+                    if contract.get("params"):
+                        lines.append(f"    params: {', '.join(contract['params'])}")
+                    if contract.get("headers"):
+                        lines.append(f"    headers: {', '.join(contract['headers'])}")
+                if len(items) > 15:
+                    lines.append(f"  ... and {len(items) - 15} more endpoints")
+            lines.append(
+                "\nNote: placeholders such as {id} or ${VAR} mean the value is computed at runtime; "
+                "'flow' chains are best-effort over resolved CALLS edges."
+            )
             return "\n".join(lines)
 
         # ------------------------------------------------------------------ #
