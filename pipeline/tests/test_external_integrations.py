@@ -13,13 +13,19 @@ from codedoc.stages.agent import _append_outbound_journeys, _backfill_required_a
 class FakeBackend:
     """Answers the handful of Cypher shapes the outbound-call helpers issue."""
 
-    def __init__(self, outbound_rows, workflows, calls, classes=None):
+    def __init__(self, outbound_rows, workflows, calls, classes=None, gateway_rows=(), node_paths=None):
+        self.gateway_rows = list(gateway_rows)
+        self.node_paths = node_paths or {}  # node id -> source file path
         self.outbound_rows = outbound_rows
         self.workflows = workflows
         self.calls = calls  # callee id -> [caller ids]
         self.classes = classes or {}  # class name -> [(field name, field type)]
 
     def execute(self, cypher, *args, **kwargs):
+        if "GatewayRoute" in cypher:
+            return self.gateway_rows
+        if "RETURN m.id AS id, m.path AS path" in cypher:
+            return [{"id": k, "path": v} for k, v in self.node_paths.items() if f"'{k}'" in cypher]
         if "CALLS_EXTERNAL" in cypher:
             if "requestType" in cypher and not any("request_type" in r for r in self.outbound_rows):
                 raise RuntimeError("no such column")
@@ -45,8 +51,10 @@ class FakeBackend:
         return []
 
 
-def _toolkit(outbound_rows=(), workflows=(), calls=None, classes=None):
-    return ReverseEngineerToolkit(FakeBackend(list(outbound_rows), list(workflows), calls or {}, classes))
+def _toolkit(outbound_rows=(), workflows=(), calls=None, classes=None, gateway_rows=(), node_paths=None):
+    return ReverseEngineerToolkit(
+        FakeBackend(list(outbound_rows), list(workflows), calls or {}, classes, gateway_rows, node_paths)
+    )
 
 
 ROW = {
@@ -361,3 +369,140 @@ def test_outbound_api_contract_handles_inline_shapes_and_old_indexes():
     (old,) = _toolkit([dict(ROW)]).outbound_api_calls()
     assert old["contract"]["request"] is None and old["contract"]["params"] == ["path:id"]
     assert render_api_contracts([{**old, "contract": {**old["contract"], "params": []}}]) == []
+
+
+GATEWAY_ROW = {
+    "id": "gwroute:PaymentsGW:payments/route.js:12:0",
+    "gateway": "PaymentsGW",
+    "mechanism": "gatewayscript",
+    "match_method": "POST",
+    "match_path": "/payments/*",
+    "match_condition": "path starts with /payments",
+    "target_url": "https://bank.example.org/api/charge",
+    "target_method": "POST",
+    "target_host": "bank.example.org",
+    "file": "payments/route.js",
+    "line": 12,
+    "confidence": 0.85,
+    "reason": "setVar routing-url",
+}
+GATEWAY_CALL = {
+    **ROW,
+    "api_id": "extapi:POST https://dp.internal:8443/payments/charge",
+    "method": "POST",
+    "url": "https://dp.internal:8443/payments/charge",
+    "host": "dp.internal:8443",
+    "caller_id": "m:ServiceC.pay",
+    "caller": "com.acme.ServiceC.pay",
+}
+
+
+def _gateway_toolkit(call=GATEWAY_CALL, gateway_rows=(GATEWAY_ROW,)):
+    return _toolkit(
+        [call],
+        workflows=[{"id": "m:CController.pay", "method": "POST", "path": "/pay"}],
+        calls={"m:ServiceC.pay": ["m:CController.pay"]},
+        gateway_rows=gateway_rows,
+    )
+
+
+def test_gateway_route_matched_by_path_and_shown_in_tool_output():
+    toolkit = _gateway_toolkit()
+
+    gateway = toolkit.outbound_api_calls()[0]["gateway"]
+
+    assert gateway["basis"] == "path"
+    assert gateway["gateways"] == ["PaymentsGW"]
+    text = toolkit.call("get_outbound_api_calls")
+    assert "via IBM DataPower gateway PaymentsGW" in text
+    assert "https://bank.example.org/api/charge" in text
+    assert "DataPower PaymentsGW → bank.example.org" in text
+
+
+def test_gateway_matching_needs_alias_when_configured_and_ignores_direct_calls(monkeypatch):
+    toolkit = _gateway_toolkit()
+    monkeypatch.setattr(toolkit, "_datapower_aliases", lambda: {"PaymentsGW": ["payments.gw.corp"]})
+    assert toolkit.outbound_api_calls()[0]["gateway"] is None
+
+    toolkit = _gateway_toolkit()
+    monkeypatch.setattr(toolkit, "_datapower_aliases", lambda: {"PaymentsGW": ["dp.internal"]})
+    assert toolkit.outbound_api_calls()[0]["gateway"]["basis"] == "alias"
+
+    direct = {**GATEWAY_CALL, "url": "https://bank.example.org/payments/charge", "host": "bank.example.org"}
+    assert _gateway_toolkit(direct).outbound_api_calls()[0]["gateway"] is None
+
+
+def test_gateway_matched_by_name_and_trivial_patterns_are_not_path_matches():
+    named = {**GATEWAY_CALL, "url": "${PAYMENTSGW_URL}/payments/x", "host": "${PAYMENTSGW_URL}"}
+    gateway = _gateway_toolkit(named).outbound_api_calls()[0]["gateway"]
+    assert gateway["basis"] == "name" and len(gateway["routes"]) == 1
+
+    unmatched = {**named, "url": "${PAYMENTSGW_URL}/other"}
+    assert _gateway_toolkit(unmatched).outbound_api_calls()[0]["gateway"]["routes"] == []
+
+    catch_all = {**GATEWAY_ROW, "match_path": "/*"}
+    assert _gateway_toolkit(gateway_rows=[catch_all]).outbound_api_calls()[0]["gateway"] is None
+
+
+def test_external_integrations_c4_and_journeys_show_the_gateway_hop():
+    toolkit = _gateway_toolkit()
+    apis = toolkit.outbound_api_calls()
+
+    doc = render_external_integrations("service-c", apis, toolkit.gateway_routes())
+    assert "## Gateway Routing [Observed]" in doc
+    assert "### Calls routed through a gateway" in doc
+    assert "| PaymentsGW | gatewayscript |" in doc
+    assert "classDef gw" in doc and "IBM DataPower: PaymentsGW" in doc
+
+    journeys = render_outbound_journeys(apis)
+    assert "IBM DataPower: PaymentsGW" in journeys
+    assert "bank.example.org" in journeys
+
+    spec = merge_outbound_into_c4_spec({"systems": [{"id": "svc", "name": "Service C"}]}, apis)
+    ids = {e["id"] for e in spec["external_systems"]}
+    assert {"out_dp_PaymentsGW", "out_bank_example_org"} <= ids
+    assert "out_dp_internal_8443" not in ids
+    assert {"from": "out_dp_PaymentsGW", "to": "out_bank_example_org", "label": "Routes to", "technology": "HTTP/REST"} in spec["relations"]
+
+
+def test_service_chain_joins_a_b_c_and_the_gateway_to_the_final_api():
+    def call(api_id, method, url, host, caller_id, caller, path):
+        return {**ROW, "api_id": api_id, "method": method, "url": url, "host": host,
+                "caller_id": caller_id, "caller": caller, "path": path}
+
+    toolkit = _toolkit(
+        [
+            call("a", "POST", "http://service-b/api/orders", "service-b", "m:A.place", "A.place", "service-a/src/A.java"),
+            call("b", "POST", "http://service-c/api/pay", "service-c", "m:B.create", "B.create", "service-b/src/B.java"),
+            {**GATEWAY_CALL, "caller_id": "m:C.pay", "path": "service-c/src/C.java"},
+        ],
+        workflows=[
+            {"id": "m:AController.place", "method": "POST", "path": "/start"},
+            {"id": "m:BController.create", "method": "POST", "path": "/api/orders"},
+            {"id": "m:CController.pay", "method": "POST", "path": "/api/pay"},
+        ],
+        calls={
+            "m:A.place": ["m:AController.place"],
+            "m:B.create": ["m:BController.create"],
+            "m:C.pay": ["m:CController.pay"],
+        },
+        gateway_rows=[GATEWAY_ROW],
+        node_paths={
+            "m:AController.place": "service-a/src/AController.java",
+            "m:BController.create": "service-b/src/BController.java",
+            "m:CController.pay": "service-c/src/CController.java",
+        },
+    )
+
+    apis = {a["url"]: a for a in toolkit.outbound_api_calls()}
+
+    assert apis["http://service-b/api/orders"]["internal_target"]["service"] == "service-b"
+    assert apis["http://service-c/api/pay"]["internal_target"]["entry"] == "POST /api/pay"
+    assert apis[GATEWAY_CALL["url"]]["internal_target"] is None
+    assert "calls inbound endpoint POST /api/orders of service service-b" in toolkit.call("get_outbound_api_calls")
+
+    journeys = render_outbound_journeys(list(apis.values()))
+    assert "End-to-end service chains" in journeys
+    for hop in ("service-a", "service-b", "service-c", "IBM DataPower: PaymentsGW", "bank.example.org"):
+        assert f" as {hop}" in journeys
+    assert "->>" in journeys and "POST /api/pay" in journeys

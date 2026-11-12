@@ -31,6 +31,15 @@ def main() -> None:
     """Code Intelligence Pipeline — generate docs from source code."""
 
 
+gateway_repo_option = click.option(
+    "--gateway-repo",
+    "gateway_repo",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Extra repo with IBM DataPower gateway artifacts (GatewayScript, XSLT, config exports, API Connect YAML). Repeatable.",
+)
+
+
 def common_pipeline_options(f):
     """Shared indexer/agent options for commands that run preflight + indexer + an agent stage.
 
@@ -49,6 +58,7 @@ def common_pipeline_options(f):
         click.option("--allow-xlarge", is_flag=True, default=False, help="Allow the pipeline to continue even when preflight classifies the repo as xlarge"),
         click.option("--ollama-num-ctx", type=int, default=None, help="Ollama KV-cache context window size (default: 131072). Ignored for Claude/OpenAI. Increase for xlarge repos if RAM allows."),
         click.option("--verbose", is_flag=True, default=False, help="Print full subprocess output"),
+        gateway_repo_option,
     )
     for option in options:
         f = option(f)
@@ -71,6 +81,7 @@ def run(
     allow_xlarge: bool,
     ollama_num_ctx: int | None,
     verbose: bool,
+    gateway_repo: tuple[str, ...],
 ) -> None:
     """Run the full pipeline: index → agent → build.
 
@@ -87,6 +98,7 @@ def run(
         "allow_xlarge": allow_xlarge or None,
         "ollama_num_ctx": ollama_num_ctx,
         "verbose": verbose or None,
+        "gateway_repos": list(gateway_repo),
     })
 
     state = run_pipeline(
@@ -106,6 +118,8 @@ def run(
         max_turns_explicit=cfg.max_turns_explicit,
         verbose=cfg.verbose,
         indexer_bin_dir=cfg.indexer_bin_dir,
+        gateway_repos=cfg.gateway_repos,
+        datapower_aliases=cfg.datapower_aliases,
         agent_prompt=cfg.agent_prompt,
         build_script=cfg.build_script,
     )
@@ -165,6 +179,7 @@ def security_audit(
     allow_xlarge: bool,
     ollama_num_ctx: int | None,
     verbose: bool,
+    gateway_repo: tuple[str, ...],
 ) -> None:
     """Run the security-audit pipeline: index -> fan-out reviewers -> risk synthesis.
 
@@ -183,6 +198,7 @@ def security_audit(
         "allow_xlarge": allow_xlarge or None,
         "ollama_num_ctx": ollama_num_ctx,
         "verbose": verbose or None,
+        "gateway_repos": list(gateway_repo),
     })
 
     state = run_security_audit_pipeline(
@@ -202,6 +218,8 @@ def security_audit(
         max_turns_explicit=cfg.max_turns_explicit,
         verbose=cfg.verbose,
         indexer_bin_dir=cfg.indexer_bin_dir,
+        gateway_repos=cfg.gateway_repos,
+        datapower_aliases=cfg.datapower_aliases,
     )
 
     from codedoc import log as _log
@@ -253,6 +271,7 @@ def security_audit(
 @click.option("--repo-size-check", default=None, type=click.Choice(["off", "warn", "strict"]), help="Repo size guardrail mode (default: warn)")
 @click.option("--verbose", is_flag=True, default=False, help="Print full subprocess output")
 @click.option("--print-config", is_flag=True, default=False, help="Print MCP client config snippets and exit")
+@gateway_repo_option
 def mcp(
     repo_path: str | None,
     db_path: str | None,
@@ -263,6 +282,7 @@ def mcp(
     repo_size_check: str | None,
     verbose: bool,
     print_config: bool,
+    gateway_repo: tuple[str, ...],
 ) -> None:
     """Run preflight + indexer and expose the resulting Kuzu DB as an MCP server."""
     from codedoc import log as _log
@@ -280,6 +300,7 @@ def mcp(
             "timeout": timeout,
             "repo_size_check": repo_size_check,
             "verbose": verbose or None,
+            "gateway_repos": list(gateway_repo),
         })
         state = run_mcp_pipeline(
             repo_path=repo_path or "",
@@ -290,6 +311,8 @@ def mcp(
             repo_size_check=cfg.repo_size_check,
             verbose=cfg.verbose,
             indexer_bin_dir=cfg.indexer_bin_dir,
+            gateway_repos=cfg.gateway_repos,
+            datapower_aliases=cfg.datapower_aliases,
         )
         if state.status != "done":
             _log.print_failure_panel(
@@ -326,6 +349,7 @@ def mcp(
 @click.option("--path", default="/mcp", show_default=True, help="HTTP MCP path")
 @click.option("--verbose", is_flag=True, default=False, help="Print full subprocess output")
 @click.option("--print-config", is_flag=True, default=False, help="Print MCP client config snippets and exit")
+@gateway_repo_option
 def mcp_http(
     repo_path: str | None,
     db_path: str | None,
@@ -339,6 +363,7 @@ def mcp_http(
     path: str,
     verbose: bool,
     print_config: bool,
+    gateway_repo: tuple[str, ...],
 ) -> None:
     """Run preflight + indexer and expose the resulting Kuzu DB over HTTP MCP."""
     from codedoc import log as _log
@@ -356,6 +381,7 @@ def mcp_http(
             "timeout": timeout,
             "repo_size_check": repo_size_check,
             "verbose": verbose or None,
+            "gateway_repos": list(gateway_repo),
         })
         state = run_mcp_http_pipeline(
             repo_path=repo_path or "",
@@ -369,6 +395,8 @@ def mcp_http(
             repo_size_check=cfg.repo_size_check,
             verbose=cfg.verbose,
             indexer_bin_dir=cfg.indexer_bin_dir,
+            gateway_repos=cfg.gateway_repos,
+            datapower_aliases=cfg.datapower_aliases,
         )
         if state.status != "done":
             _log.print_failure_panel(

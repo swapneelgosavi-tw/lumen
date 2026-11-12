@@ -102,7 +102,9 @@ public class KuzuGraphStore implements GraphStore {
                 "CREATE REL TABLE IF NOT EXISTS WORKFLOW_STEP (FROM Method TO Workflow, FROM Function TO Workflow, FROM AsyncFunction TO Workflow, FROM ArrowFunction TO Workflow, FROM Component TO Workflow, step INT64)",
                 "CREATE REL TABLE IF NOT EXISTS IN_DOMAIN (FROM Class TO Domain, FROM Interface TO Domain, FROM Method TO Domain, FROM Component TO Domain, FROM Module TO Domain, FROM AsyncFunction TO Domain, FROM Function TO Domain, FROM ArrowFunction TO Domain)",
                 // Outbound integrations
-                "CREATE REL TABLE IF NOT EXISTS CALLS_EXTERNAL (FROM Method TO ExternalApi, FROM Constructor TO ExternalApi, FROM Function TO ExternalApi, FROM AsyncFunction TO ExternalApi, FROM ArrowFunction TO ExternalApi, FROM ExtensionFunction TO ExternalApi, FROM SuspendFunction TO ExternalApi, FROM Lambda TO ExternalApi, FROM InitBlock TO ExternalApi, FROM Module TO ExternalApi, FROM Property TO ExternalApi, FROM Component TO ExternalApi, FROM Hook TO ExternalApi, FROM Generator TO ExternalApi, FROM Class TO ExternalApi, lineNumber INT64, client STRING, confidence DOUBLE, reason STRING, requestType STRING, responseType STRING, params STRING, requestHeaders STRING)"
+                "CREATE REL TABLE IF NOT EXISTS CALLS_EXTERNAL (FROM Method TO ExternalApi, FROM Constructor TO ExternalApi, FROM Function TO ExternalApi, FROM AsyncFunction TO ExternalApi, FROM ArrowFunction TO ExternalApi, FROM ExtensionFunction TO ExternalApi, FROM SuspendFunction TO ExternalApi, FROM Lambda TO ExternalApi, FROM InitBlock TO ExternalApi, FROM Module TO ExternalApi, FROM Property TO ExternalApi, FROM Component TO ExternalApi, FROM Hook TO ExternalApi, FROM Generator TO ExternalApi, FROM Class TO ExternalApi, lineNumber INT64, client STRING, confidence DOUBLE, reason STRING, requestType STRING, responseType STRING, params STRING, requestHeaders STRING)",
+                // IBM DataPower gateway routing (written by the Node indexer's datapower mode)
+                "CREATE REL TABLE IF NOT EXISTS ROUTES_TO (FROM GatewayRoute TO ExternalApi, confidence DOUBLE, reason STRING)"
         };
 
         // Post-processing node tables must be created BEFORE the rel tables that reference them
@@ -111,7 +113,8 @@ public class KuzuGraphStore implements GraphStore {
         String[] abstractionNodeDefs = {
                 "CREATE NODE TABLE IF NOT EXISTS Workflow (id STRING, name STRING, qualifiedName STRING, entryPointId STRING, terminalId STRING, stepCount INT64, type STRING, httpMethod STRING, httpPath STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))",
                 "CREATE NODE TABLE IF NOT EXISTS Domain (id STRING, name STRING, qualifiedName STRING, heuristicLabel STRING, cohesion DOUBLE, memberCount INT64, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))",
-                "CREATE NODE TABLE IF NOT EXISTS ExternalApi (id STRING, name STRING, qualifiedName STRING, httpMethod STRING, url STRING, host STRING, client STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))"
+                "CREATE NODE TABLE IF NOT EXISTS ExternalApi (id STRING, name STRING, qualifiedName STRING, httpMethod STRING, url STRING, host STRING, client STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))",
+                "CREATE NODE TABLE IF NOT EXISTS GatewayRoute (id STRING, name STRING, qualifiedName STRING, gateway STRING, mechanism STRING, matchMethod STRING, matchPath STRING, matchHost STRING, matchCondition STRING, targetUrl STRING, targetMethod STRING, targetHost STRING, filePath STRING, lineNumber INT64, confidence DOUBLE, reason STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))"
         };
 
         for (String nodeDef : abstractionNodeDefs) {
@@ -140,7 +143,7 @@ public class KuzuGraphStore implements GraphStore {
                 "IMPORTS", "EXPORTS", "RENDERS", "USES_HOOK", "PROP_DEPENDENCY",
                 "DECORATES", "YIELDS",
                 "EXTENSION_OF", "DELEGATES_TO", "SEALED_SUBTYPE", "COMPANION_OF", "SUSPENDS",
-                "WORKFLOW_STEP", "IN_DOMAIN", "CALLS_EXTERNAL"}) {
+                "WORKFLOW_STEP", "IN_DOMAIN", "CALLS_EXTERNAL", "ROUTES_TO"}) {
             try {
                 connection.query("DROP TABLE " + relType);
             } catch (Exception ignored) {
@@ -151,6 +154,10 @@ public class KuzuGraphStore implements GraphStore {
                 connection.query("DROP TABLE " + nodeTypeToTable(type));
             } catch (Exception ignored) {
             }
+        }
+        try {
+            connection.query("DROP TABLE GatewayRoute");
+        } catch (Exception ignored) {
         }
         initSchema();
     }

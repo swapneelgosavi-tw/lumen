@@ -6,6 +6,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from codedoc.gateway_routing import (
+    fetch_gateway_routes,
+    link_internal_calls,
+    load_datapower_config,
+    match_gateway,
+    route_target,
+    service_of,
+)
 from codedoc.kg_tools.utils import (
     NODE_TYPES,
     REL_TYPES,
@@ -167,6 +175,18 @@ class ReverseEngineerToolkit:
         self._outbound_cache = result
         return result
 
+    def gateway_routes(self) -> list[dict]:
+        """IBM DataPower routing rules found in the indexed code (GatewayRoute nodes); [] when none."""
+        cached = getattr(self, "_gateway_cache", None)
+        if cached is None:
+            cached = fetch_gateway_routes(self.backend)
+            self._gateway_cache = cached
+        return cached
+
+    def _datapower_aliases(self) -> dict[str, list[str]]:
+        config = load_datapower_config(getattr(self.backend, "db_path", ""))
+        return {str(k): list(v) for k, v in (config.get("aliases") or {}).items()}
+
     _OUTBOUND_BASE_COLUMNS = (
         "a.id AS api_id, a.httpMethod AS method, a.url AS url, a.host AS host, "
         "a.client AS client, a.language AS language, m.id AS caller_id, "
@@ -243,8 +263,11 @@ class ReverseEngineerToolkit:
                     api["flows"].append({"entry": label, "entry_id": entry_id, "chain": chain})
         result = []
         shape_cache: dict[str, dict | None] = {}
+        routes = self.gateway_routes()
+        aliases = self._datapower_aliases()
         for api in apis.values():
             api.pop("_caller_ids", None)
+            api["gateway"] = match_gateway(api, routes, aliases)
             api["contract"] = {
                 "request": self._resolve_type_shape(api.pop("_request_type"), shape_cache),
                 "response": self._resolve_type_shape(api.pop("_response_type"), shape_cache),
@@ -252,7 +275,25 @@ class ReverseEngineerToolkit:
                 "headers": api.pop("_headers"),
             }
             result.append(api)
+        self._link_services(result, entries)
         return result
+
+    def _link_services(self, apis: list[dict], entries: dict[str, str]) -> None:
+        """Link calls to inbound endpoints of other services in the same index (service-to-service chains)."""
+        entry_ids = list(entries)
+        paths: dict[str, str] = {}
+        for i in range(0, len(entry_ids), 50):
+            cond = " OR ".join(f"m.id = '{_cypher_escape(n)}'" for n in entry_ids[i:i + 50])
+            try:
+                rows = self.backend.execute(f"MATCH (m) WHERE {cond} RETURN m.id AS id, m.path AS path") or []
+            except Exception:
+                rows = []
+            paths.update({str(r.get("id")): str(r.get("path") or "") for r in rows})
+        default = Path(self.repo_path).name if self.repo_path else ""
+        for api in apis:
+            first = (api.get("callers") or [{}])[0]
+            api["service"] = service_of(str(first.get("path") or ""), default)
+        link_internal_calls(apis, entries, {k: service_of(v, default) for k, v in paths.items()})
 
     # ── Request / response contracts ────────────────────────────────────────
 
@@ -2422,6 +2463,9 @@ class ReverseEngineerToolkit:
                     lines.append("\n── Outbound HTTP hosts (call get_outbound_api_calls for detail) ──")
                     for host, count in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
                         lines.append(f"  {host}  ({count} endpoint{'s' if count != 1 else ''})")
+                n_routes = len(self.gateway_routes())
+                if n_routes:
+                    lines.append(f"  IBM DataPower gateway routing rules indexed: {n_routes} (shown by get_outbound_api_calls)")
             except Exception:
                 pass
             return "\n".join(lines)
@@ -2434,7 +2478,8 @@ class ReverseEngineerToolkit:
             """List outbound HTTP calls this code makes to remote services (RestTemplate, WebClient,
             Feign, OkHttp, axios, fetch, HttpService, ...), grouped by remote host, with the calling
             code and the inbound HTTP entry points that can reach each call. Use it to document
-            external systems, integrations and the outbound hops of business journeys."""
+            external systems, integrations and the outbound hops of business journeys. Calls that go through
+            an IBM DataPower gateway are annotated with the gateway routing rule and the final external target."""
             apis = self.outbound_api_calls()
             if not apis:
                 return "No outbound HTTP calls detected."
@@ -2451,8 +2496,29 @@ class ReverseEngineerToolkit:
                         lines.append(f"    called from {caller['type']} {caller['caller']}{where}")
                     if len(api["callers"]) > 4:
                         lines.append(f"    ... and {len(api['callers']) - 4} more callers")
+                    internal = api.get("internal_target")
+                    if internal:
+                        lines.append(
+                            f"    calls inbound endpoint {internal['entry']} of service {internal.get('service') or '(unknown)'} "
+                            "(matched by path; follow that service's own calls for the next hop)"
+                        )
+                    gw = api.get("gateway")
+                    if gw:
+                        lines.append(
+                            f"    via IBM DataPower gateway {', '.join(gw['gateways'])} "
+                            f"(matched by {gw['basis']}; routing is inferred from gateway code):"
+                        )
+                        for route in gw["routes"][:4]:
+                            cond = f" when {route['match_condition']}" if route.get("match_condition") else ""
+                            lines.append(f"      route {route['match_path'] or '(any path)'}{cond} → {route_target(route)}  ({route['file']}:{route['line']})")
+                        if len(gw["routes"]) > 4:
+                            lines.append(f"      ... and {len(gw['routes']) - 4} more routes")
                     for flow in api["flows"][:3]:
-                        lines.append(f"    flow: {flow['entry']}: {format_chain(flow['chain'])} → {api['method']} {api['host']}")
+                        final = f"{api['method']} {api['host']}"
+                        if gw:
+                            hosts = sorted({r["target_host"] for r in gw["routes"] if r.get("target_host")})
+                            final += f" → DataPower {', '.join(gw['gateways'])}" + (f" → {', '.join(hosts)}" if hosts else "")
+                        lines.append(f"    flow: {flow['entry']}: {format_chain(flow['chain'])} → {final}")
                     contract = api.get("contract") or {}
                     for label, key in (("request", "request"), ("response", "response")):
                         shape = contract.get(key)
@@ -2469,6 +2535,20 @@ class ReverseEngineerToolkit:
                 "\nNote: placeholders such as {id} or ${VAR} mean the value is computed at runtime; "
                 "'flow' chains are best-effort over resolved CALLS edges."
             )
+            routes = self.gateway_routes()
+            if routes:
+                matched = {id(r) for api in apis if api.get("gateway") for r in api["gateway"]["routes"]}
+                lines.append(
+                    f"\n── IBM DataPower gateway routes ({len(routes)} indexed, {len(matched)} matched to the calls above) ──"
+                )
+                for route in routes[:25]:
+                    cond = f" when {route['match_condition']}" if route.get("match_condition") else ""
+                    lines.append(
+                        f"  [{route['gateway']}] {route['match_method'] or 'ANY'} {route['match_path'] or '(any path)'}{cond} → "
+                        f"{route_target(route)}  ({route['file']}:{route['line']})"
+                    )
+                if len(routes) > 25:
+                    lines.append(f"  ... and {len(routes) - 25} more routes")
             return "\n".join(lines)
 
         # ------------------------------------------------------------------ #

@@ -1,0 +1,5 @@
+{
+  "name": "service-c",
+  "version": "1.0.0",
+  "dependencies": { "axios": "^1.0.0", "express": "^4.0.0" }
+}

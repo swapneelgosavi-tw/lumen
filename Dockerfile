@@ -92,8 +92,10 @@ RUN npm ci --omit=dev --silent \
               node_modules/cmake-js \
               node_modules/node-addon-api \
               node_modules/node-api-headers \
+    # yaml keeps runtime code in dist/doc, so it is excluded from the prune.
     && find node_modules -type d \( -name test -o -name tests -o -name __tests__ \
        -o -name example -o -name examples -o -name docs -o -name doc \) \
+       -not -path "node_modules/yaml/*" \
        -exec rm -rf {} + 2>/dev/null || true \
     && find node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "CHANGELOG*" \
        -o -name "*.map" \) -delete 2>/dev/null || true

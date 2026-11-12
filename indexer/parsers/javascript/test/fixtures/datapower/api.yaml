@@ -1,0 +1,39 @@
+swagger: '2.0'
+info:
+  title: Payments API
+  x-ibm-name: payments-api
+  version: 1.0.0
+basePath: /payments
+paths:
+  /charge:
+    post: {responses: {'200': {description: ok}}}
+x-ibm-configuration:
+  properties:
+    target-url:
+      value: https://pay.example.com/api
+      encoded: false
+  assembly:
+    execute:
+      - operation-switch:
+          case:
+            - operations:
+                - verb: post
+                  path: /charge
+              execute:
+                - invoke:
+                    title: charge
+                    target-url: $(target-url)/v2/charges
+                    verb: POST
+      - switch:
+          case:
+            - condition: ($(request.path) = '/refunds')
+              execute:
+                - invoke:
+                    target-url: https://refund.example.com$(request.path)
+                    verb: keep
+          otherwise:
+            - gatewayscript:
+                title: route
+                source: |
+                  var sm = require('service-metadata');
+                  sm.setVar('var://service/routing-url', 'https://fallback.example.com/x');

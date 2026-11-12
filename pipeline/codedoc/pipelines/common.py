@@ -39,6 +39,8 @@ def init_state(
     build_script: str = "",
     site_dir: str = "",
     repo_name: str = "",
+    gateway_repos: list[str] | None = None,
+    datapower_aliases: dict[str, list[str]] | None = None,
 ) -> PipelineState:
     """Build the initial state shared by all pipeline modes."""
     return PipelineState(
@@ -63,6 +65,8 @@ def init_state(
         agent_prompt=agent_prompt,
         build_script=build_script,
         site_dir=site_dir,
+        gateway_repos=list(gateway_repos or []),
+        datapower_aliases=dict(datapower_aliases or {}),
         status="running",
         started_at=datetime.now(timezone.utc).isoformat(),
         mode=mode,

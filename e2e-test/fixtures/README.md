@@ -10,6 +10,11 @@ regressions, not for exercising indexer/parser correctness at scale.
   decorators, external dependency, an unauthenticated route, a class with no incoming
   references) to give every pipeline's roles something real to find.
 
+- `datapower-demo/` — manual-only (not in `FIXTURES`): `service-c/` is an Express service
+  calling an IBM DataPower gateway; `gateway/payments-gw/route.js` is the GatewayScript that
+  routes to the final external APIs. Try it with
+  `make lumen-run REPO=e2e-test/fixtures/datapower-demo/service-c GATEWAY_REPO=e2e-test/fixtures/datapower-demo/gateway ARGS='...'`.
+
 Add more fixtures here (e.g. a small JS/TS or Java repo) if a future pipeline needs
 different structural signal than this one provides — `test-lumen.sh` runs every discovered
 pipeline against every directory in its `FIXTURES` array.

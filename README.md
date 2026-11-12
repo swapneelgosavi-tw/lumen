@@ -382,6 +382,7 @@ lumen run REPO_PATH [OPTIONS]
   --max-turns INT     Max LLM turns per phase (default: 60)
   --repo-size-check   off | warn | strict (default: warn)
   --allow-xlarge      Force full pipeline on xlarge repos
+  --gateway-repo PATH IBM DataPower gateway repo to index for routing rules (repeatable)
   --verbose           Stream logs as the pipeline runs
 ```
 
@@ -472,6 +473,33 @@ allow_xlarge = false
 [paths]
 output_dir = "./my-output"
 ```
+
+### IBM DataPower gateway routing
+
+If a service calls an IBM DataPower gateway that routes to the real external API, lumen can
+follow the call through the gateway and show `service → DataPower → external API` in
+`current-state/external-integrations.md`, the C4 diagram and the business journeys.
+It reads GatewayScript (`.js`/`.ts`), XSLT, `.xcfg` config exports and API Connect YAML
+from the repo itself and from any gateway repos you pass:
+
+```bash
+make lumen-docker-run REPO=/path/to/service-c GATEWAY_REPO=/path/to/gateway-repo \
+  ARGS="--provider copilot --model claude-sonnet-5"
+# native: lumen run /path/to/service-c --gateway-repo /path/to/gateway-repo
+```
+
+Calls are matched to a gateway by URL path, or by gateway name/alias:
+
+```toml
+[datapower]
+gateway_repos = ["/path/to/gateway-repo"]
+
+[datapower.aliases]
+PaymentsGW = ["pay-gw.corp.example"]
+```
+
+Chaining A → B → C → gateway → external API works when all services are in one indexed
+repo or parent directory; separate repos are indexed separately and are not chained.
 
 ---
 

@@ -12,6 +12,8 @@
  *   --neo4j-user <user>         Neo4j username (default: neo4j)
  *   --neo4j-password <pass>     Neo4j password
  *   --neo4j-database <db>       Neo4j database (default: neo4j)
+ *   --mode datapower            Only index IBM DataPower gateway routing rules (GatewayScript, XSLT,
+ *                               config exports, API Connect YAML) into the graph; appends to an existing DB
  */
 
 const fs = require('fs');
@@ -998,6 +1000,39 @@ function getLanguage(filePath) {
     return 'JavaScript';
 }
 
+function runDatapowerMode(rootDir, storeOptions) {
+    const { scanDatapower, addRoutesToGraph } = require('./datapower');
+    const { rules, counts } = scanDatapower(rootDir);
+    const artifacts = Object.entries(counts).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(', ');
+    if (!rules.length) {
+        console.error(`DataPower: no gateway routing rules found${artifacts ? ` (scanned: ${artifacts})` : ''}`);
+        if (storeOptions.backend === 'json') console.log(JSON.stringify({ nodes: [], relationships: [] }));
+        return;
+    }
+    const graph = new CodeGraphBuilder();
+    addRoutesToGraph(graph, rules);
+    console.error(`DataPower: ${rules.length} gateway routing rule(s) from ${artifacts}`);
+    const graphJson = graph.toJSON();
+    if (storeOptions.backend === 'json') {
+        console.log(JSON.stringify(graphJson, null, 2));
+        return;
+    }
+    const { createStore } = require('./store');
+    (async () => {
+        const store = createStore(storeOptions);
+        try {
+            await store.initSchema();
+            await store.save(graphJson);
+            console.error(await store.summary());
+        } finally {
+            await store.close();
+        }
+    })().catch(err => {
+        console.error('Error writing to graph database:', err.message);
+        process.exit(1);
+    });
+}
+
 function main() {
     const args = process.argv.slice(2);
     if (args.length < 1) {
@@ -1015,6 +1050,7 @@ function main() {
     let neo4jUser = 'neo4j';
     let neo4jPassword = '';
     let neo4jDatabase = 'neo4j';
+    let mode = 'default';
 
     for (let i = 1; i < args.length; i++) {
         switch (args[i]) {
@@ -1027,6 +1063,7 @@ function main() {
             case '--neo4j-password': neo4jPassword = args[++i]; break;
             case '--neo4j-database': neo4jDatabase = args[++i]; break;
             case '--repo-name': repoName = args[++i]; break;
+            case '--mode': mode = args[++i]; break;
         }
     }
 
@@ -1049,6 +1086,11 @@ function main() {
     if (!fs.existsSync(rootDir)) {
         console.error(`Directory not found: ${rootDir}`);
         process.exit(1);
+    }
+
+    if (mode === 'datapower') {
+        runDatapowerMode(rootDir, { backend, dbPath, neo4jUri, neo4jUser, neo4jPassword, neo4jDatabase });
+        return;
     }
 
     const graph = new CodeGraphBuilder();
