@@ -54,12 +54,18 @@ class Config:
     verbose: bool = False
     timeout_explicit: bool = False
     max_turns_explicit: bool = False
+    # IBM DataPower: extra repos holding gateway artifacts, and gateway-name -> host/name aliases
+    # (from `[datapower]` / `[datapower.aliases]` in .codedoc.toml) used to match calls to gateway routes.
+    gateway_repos: list[str] = field(default_factory=list)
+    datapower_aliases: dict[str, list[str]] = field(default_factory=dict)
 
 
 def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
     """Build a Config by merging defaults ← toml ← CLI flags."""
     merged: dict[str, Any] = dict(_DEFAULTS)
     explicit_keys: set[str] = set()
+    gateway_repos: list[str] = []
+    datapower_aliases: dict[str, list[str]] = {}
 
     # Layer 2: .codedoc.toml
     toml_path = Path.cwd() / ".codedoc.toml"
@@ -70,10 +76,17 @@ def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
             if section in data:
                 merged.update(data[section])
                 explicit_keys.update(data[section].keys())
+        datapower = data.get("datapower", {})
+        gateway_repos.extend(str(p) for p in datapower.get("gateway_repos", []))
+        for name, values in (datapower.get("aliases", {}) or {}).items():
+            datapower_aliases[str(name)] = [str(v) for v in ([values] if isinstance(values, str) else values)]
 
     # Layer 3: CLI overrides (None values are unset flags — skip them)
     if cli_overrides:
         for k, v in cli_overrides.items():
+            if k == "gateway_repos":
+                gateway_repos.extend(str(p) for p in (v or []) if str(p) not in gateway_repos)
+                continue
             if v is not None:
                 merged[k] = v
                 explicit_keys.add(k)
@@ -81,4 +94,6 @@ def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
     config_kwargs = {k: merged[k] for k in Config.__dataclass_fields__ if k in merged}
     config_kwargs["timeout_explicit"] = "timeout" in explicit_keys
     config_kwargs["max_turns_explicit"] = "max_turns" in explicit_keys
+    config_kwargs["gateway_repos"] = gateway_repos
+    config_kwargs["datapower_aliases"] = datapower_aliases
     return Config(**config_kwargs)

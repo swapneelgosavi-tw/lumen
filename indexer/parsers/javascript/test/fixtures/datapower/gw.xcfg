@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<datapower-configuration version="3">
+  <configuration domain="default">
+    <MultiProtocolGateway name="PaymentsGW" xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+      <mAdminState>enabled</mAdminState>
+      <StylePolicy class="StylePolicy">PaymentsPolicy</StylePolicy>
+      <BackendUrl>https://pay.example.com:8443/api</BackendUrl>
+    </MultiProtocolGateway>
+    <StylePolicy name="PaymentsPolicy">
+      <PolicyMaps><Match class="Matching">M-pay</Match><Rule class="StylePolicyRule">R-pay</Rule></PolicyMaps>
+      <PolicyMaps><Match class="Matching">M-kyc</Match><Rule class="StylePolicyRule">R-kyc</Rule></PolicyMaps>
+    </StylePolicy>
+    <Matching name="M-pay"><MatchRules><Type>url</Type><Url>/payments/*</Url></MatchRules></Matching>
+    <Matching name="M-kyc"><MatchRules><Type>url</Type><Url>/kyc/*</Url></MatchRules></Matching>
+    <StylePolicyRule name="R-pay"><Actions class="StylePolicyAction">A-xf</Actions></StylePolicyRule>
+    <StylePolicyRule name="R-kyc"><Actions class="StylePolicyAction">A-route</Actions></StylePolicyRule>
+    <StylePolicyAction name="A-xf"><Type>xform</Type><Transform>local:///route-payments.xsl</Transform></StylePolicyAction>
+    <StylePolicyAction name="A-route"><Type>route-action</Type><Destination>https://kyc.example.com/v1</Destination></StylePolicyAction>
+    <XMLFirewallService name="LegacyFW"><RemoteAddress>legacy.internal</RemoteAddress><RemotePort>9090</RemotePort></XMLFirewallService>
+  </configuration>
+</datapower-configuration>

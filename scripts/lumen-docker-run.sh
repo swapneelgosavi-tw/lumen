@@ -5,6 +5,7 @@ set -euo pipefail
 DOCKER_IMAGE="${DOCKER_IMAGE:-lumen}"
 REPO="${REPO:-}"
 ARGS="${ARGS:-}"
+GATEWAY_REPO="${GATEWAY_REPO:-}"
 OUTPUT_PATH="${OUTPUT_PATH:-$(pwd)/output}"
 
 if [ -z "${REPO}" ]; then
@@ -20,6 +21,15 @@ docker_args=(
   -v "${REPO}:/repo"
   -v "${OUTPUT_PATH}:/workspace/output"
 )
+
+# GATEWAY_REPO: comma- or space-separated host paths of IBM DataPower gateway repos, mounted read-only.
+gateway_args=()
+gateway_index=0
+for gateway_path in ${GATEWAY_REPO//,/ }; do
+  gateway_index=$((gateway_index + 1))
+  docker_args+=( -v "${gateway_path}:/gateway/${gateway_index}:ro" )
+  gateway_args+=( --gateway-repo "/gateway/${gateway_index}" )
+done
 
 if [ -t 0 ]; then
   docker_args+=( -i )
@@ -43,7 +53,7 @@ if [ -n "${CMG_JS_HEAP_MB:-}" ]; then
   docker_args+=( -e "CMG_JS_HEAP_MB=${CMG_JS_HEAP_MB}" )
 fi
 
-cmd=( "${DOCKER_IMAGE}" run /repo --repo-name "$(basename "${REPO}")" --output-dir /workspace/output )
+cmd=( "${DOCKER_IMAGE}" run /repo --repo-name "$(basename "${REPO}")" --output-dir /workspace/output "${gateway_args[@]+"${gateway_args[@]}"}" )
 if [ -n "${ARGS}" ]; then
   # shellcheck disable=SC2206
   extra_args=( ${ARGS} )

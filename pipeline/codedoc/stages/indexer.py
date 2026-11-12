@@ -5,6 +5,8 @@ Wraps the existing cmg-* binaries to produce a KuzuDB graph from a repo.
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +42,50 @@ def _stderr_excerpt(stderr: str) -> str:
 
 # CLI flag for the KuzuDB path (unified across all binaries)
 _DB_FLAG = "--db-path"
+
+
+DATAPOWER_SIDECAR = ".datapower.json"
+
+
+def _index_datapower(state: PipelineState, repo: Path, kuzu_dir: Path, repo_name: str) -> None:
+    """Best-effort post-step: add IBM DataPower gateway routing rules to the graph.
+
+    Runs after every language indexer (the Java indexer rewrites the graph, so this must come last) by invoking
+    the JS parser in ``--mode datapower`` over the repo itself and each ``--gateway-repo``. The mode only writes
+    when it finds DataPower artifacts, so repos without a gateway are untouched. Failures never fail the run.
+    """
+    stage = "indexer"
+    sources = [repo] + [Path(p).resolve() for p in state.gateway_repos]
+    binary = Path(state.indexer_bin_dir) / "cmg-js"
+    if not binary.exists():
+        if state.gateway_repos:
+            state.log(stage, f"DataPower: skipped, indexer binary not found: {binary}")
+        return
+    total_rules = 0
+    for source in sources:
+        if not source.is_dir():
+            state.log(stage, f"DataPower: skipped, gateway repo is not a directory: {source}")
+            continue
+        cmd = [str(binary), str(source), _DB_FLAG, str(kuzu_dir), "--repo-name", repo_name, "--mode", "datapower"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=state.timeout)
+        except subprocess.TimeoutExpired:
+            state.log(stage, f"DataPower: scan of {source} timed out after {state.timeout}s; continuing without it")
+            continue
+        if proc.returncode != 0:
+            state.log(stage, f"DataPower: scan of {source} failed (exit {proc.returncode}); continuing\n{_stderr_excerpt(proc.stderr)}")
+            continue
+        found = re.search(r"DataPower: (\d+) gateway routing rule", proc.stderr or "")
+        if found:
+            count = int(found.group(1))
+            total_rules += count
+            state.log(stage, f"DataPower: {count} gateway routing rule(s) from {source}")
+        if state.verbose and proc.stderr:
+            state.log(stage, f"cmg-js (datapower) stderr:\n{proc.stderr}")
+    if total_rules or state.datapower_aliases or state.gateway_repos:
+        # Hidden so it is ignored by the "single KuzuDB entry" fallback below.
+        sidecar = {"aliases": state.datapower_aliases, "gateway_repos": [str(p) for p in state.gateway_repos], "rules": total_rules}
+        (kuzu_dir / DATAPOWER_SIDECAR).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
 
 
 def run_indexer(state: PipelineState) -> PipelineState:
@@ -142,6 +188,8 @@ def run_indexer(state: PipelineState) -> PipelineState:
             _log.update_indexer_progress(display, "done")
     finally:
         _log.stop_indexer_progress()
+
+    _index_datapower(state, repo, kuzu_dir, effective_repo_name)
 
     # --- Locate the database created by the indexer ---
     # All binaries (Java, JS, Python) create {repo_name}-db inside --db-path.

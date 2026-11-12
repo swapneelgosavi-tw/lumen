@@ -17,8 +17,8 @@ lumen-docker-rebuild:
 	docker image prune -f
 
 lumen-docker-run:
-	@if [ -z "$(REPO)" ]; then echo "Usage: make lumen-docker-run REPO=/path/to/repo [ARGS='--provider ollama ... [--allow-xlarge]']"; exit 1; fi
-	REPO="$(REPO)" OUTPUT_PATH="$(PWD)/output" DOCKER_IMAGE="$(DOCKER_IMAGE)" ARGS="$(ARGS)" \
+	@if [ -z "$(REPO)" ]; then echo "Usage: make lumen-docker-run REPO=/path/to/repo [GATEWAY_REPO=/path/to/datapower-repo] [ARGS='--provider ollama ... [--allow-xlarge]']"; exit 1; fi
+	REPO="$(REPO)" GATEWAY_REPO="$(GATEWAY_REPO)" OUTPUT_PATH="$(PWD)/output" DOCKER_IMAGE="$(DOCKER_IMAGE)" ARGS="$(ARGS)" \
 	  ./scripts/lumen-docker-run.sh
 
 lumen-docker-mcp:
@@ -31,8 +31,8 @@ lumen-docker-mcp:
 	  ./scripts/lumen-docker-mcp.sh
 
 lumen-docker-security-audit:
-	@if [ -z "$(REPO)" ]; then echo "Usage: make lumen-docker-security-audit REPO=/path/to/repo [ARGS='--provider ollama ... [--allow-xlarge]']"; exit 1; fi
-	REPO="$(REPO)" OUTPUT_PATH="$(PWD)/output" DOCKER_IMAGE="$(DOCKER_IMAGE)" ARGS="$(ARGS)" \
+	@if [ -z "$(REPO)" ]; then echo "Usage: make lumen-docker-security-audit REPO=/path/to/repo [GATEWAY_REPO=/path/to/datapower-repo] [ARGS='--provider ollama ... [--allow-xlarge]']"; exit 1; fi
+	REPO="$(REPO)" GATEWAY_REPO="$(GATEWAY_REPO)" OUTPUT_PATH="$(PWD)/output" DOCKER_IMAGE="$(DOCKER_IMAGE)" ARGS="$(ARGS)" \
 	  ./scripts/lumen-docker-security-audit.sh
 
 lumen-docker-docs:
@@ -74,7 +74,7 @@ lumen-run:
 	  echo "  Anthropic: ARGS='--provider anthropic --model claude-sonnet-4-6'"; \
 	  echo "  Ollama:    ARGS='--provider ollama --model qwen2.5:32b --base-url http://127.0.0.1:11434/v1'"; \
 	  exit 1; fi
-	cd pipeline && uv run lumen run "$(REPO)" --output-dir "$(PWD)/output" $(ARGS)
+	cd pipeline && uv run lumen run "$(REPO)" --output-dir "$(PWD)/output" $(if $(GATEWAY_REPO),--gateway-repo "$(GATEWAY_REPO)") $(ARGS)
 
 lumen-security-audit:
 	@if [ -z "$(REPO)" ]; then \
@@ -88,7 +88,7 @@ lumen-security-audit:
 	  echo "  Anthropic: ARGS='--provider anthropic --model claude-sonnet-4-6'"; \
 	  echo "  Ollama:    ARGS='--provider ollama --model qwen2.5:32b --base-url http://127.0.0.1:11434/v1'"; \
 	  exit 1; fi
-	cd pipeline && uv run lumen security-audit "$(REPO)" --output-dir "$(PWD)/output" $(ARGS)
+	cd pipeline && uv run lumen security-audit "$(REPO)" --output-dir "$(PWD)/output" $(if $(GATEWAY_REPO),--gateway-repo "$(GATEWAY_REPO)") $(ARGS)
 
 lumen-mcp:
 	@if [ -z "$(DB)" ] && [ -z "$(REPO)" ]; then \

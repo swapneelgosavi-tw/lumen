@@ -215,6 +215,13 @@ def _outbound_apis(toolkit: Any) -> list[dict]:
         return []
 
 
+def _gateway_routes(toolkit: Any) -> list[dict]:
+    try:
+        return toolkit.gateway_routes()
+    except Exception:
+        return []
+
+
 def _has_content(data: str | None, empty_sentinel: str) -> bool:
     """Return True if data looks like real content rather than an empty/error result."""
     if not data:
@@ -1281,7 +1288,9 @@ def _backfill_required_artifacts(
     external_target = root / EXTERNAL_INTEGRATIONS_PATH
     if not external_target.exists():
         outbound_apis = _outbound_apis(toolkit)
-        content = render_external_integrations(repo_name or Path(repo_path).name or "repository", outbound_apis)
+        content = render_external_integrations(
+            repo_name or Path(repo_path).name or "repository", outbound_apis, _gateway_routes(toolkit)
+        )
         if content:
             _write_artifact(artifacts_dir, EXTERNAL_INTEGRATIONS_PATH, content)
             generated.append(str(external_target))

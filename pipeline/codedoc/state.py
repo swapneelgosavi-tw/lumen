@@ -71,6 +71,8 @@ class PipelineState:
     agent_prompt: str = ""
     build_script: str = ""
     site_dir: str = ""  # override for doc-site location
+    gateway_repos: list[str] = field(default_factory=list)  # extra repos holding IBM DataPower artifacts
+    datapower_aliases: dict[str, list[str]] = field(default_factory=dict)
 
     def log(self, stage: str, message: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")

@@ -31,6 +31,8 @@ def run_mcp_http_pipeline(
     verbose: bool = False,
     indexer_bin_dir: str = "",
     repo_name: str | None = None,
+    gateway_repos: list[str] | None = None,
+    datapower_aliases: dict[str, list[str]] | None = None,
 ) -> PipelineState:
     """Execute the preflight + indexer path and prepare HTTP MCP metadata."""
     repo = Path(repo_path).resolve()
@@ -47,6 +49,8 @@ def run_mcp_http_pipeline(
         timeout_explicit=timeout_explicit,
         indexer_bin_dir=indexer_bin_dir,
         repo_name=resolved_repo_name,
+        gateway_repos=gateway_repos,
+        datapower_aliases=datapower_aliases,
     )
     log_pipeline_start(state, repo_path=str(repo), run_dir=run_dir, label="MCP HTTP pipeline")
 

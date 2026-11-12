@@ -43,6 +43,8 @@ def run_pipeline(
     verbose: bool = False,
     indexer_bin_dir: str = "",
     repo_name: str | None = None,
+    gateway_repos: list[str] | None = None,
+    datapower_aliases: dict[str, list[str]] | None = None,
 ) -> PipelineState:
     """Execute the security-audit pipeline and return final state."""
     repo = Path(repo_path).resolve()
@@ -67,6 +69,8 @@ def run_pipeline(
         max_turns_explicit=max_turns_explicit,
         indexer_bin_dir=indexer_bin_dir,
         repo_name=resolved_repo_name,
+        gateway_repos=gateway_repos,
+        datapower_aliases=datapower_aliases,
     )
     log_pipeline_start(state, repo_path=str(repo), run_dir=run_dir, label="security-audit pipeline")
 

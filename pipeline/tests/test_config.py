@@ -59,3 +59,22 @@ timeout = 900
     assert cfg.timeout == 900
     assert cfg.timeout_explicit is True
     assert cfg.max_turns_explicit is False
+
+
+def test_load_config_reads_datapower_section_and_merges_cli_gateway_repos(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path(".codedoc.toml").write_text(
+        """
+[datapower]
+gateway_repos = ["/srv/gw-a"]
+
+[datapower.aliases]
+PaymentsGW = ["payments.gw.corp", "pay-gw"]
+OrdersGW = "orders.gw.corp"
+"""
+    )
+
+    cfg = load_config({"gateway_repos": ["/srv/gw-b", "/srv/gw-a"]})
+
+    assert cfg.gateway_repos == ["/srv/gw-a", "/srv/gw-b"]
+    assert cfg.datapower_aliases == {"PaymentsGW": ["payments.gw.corp", "pay-gw"], "OrdersGW": ["orders.gw.corp"]}

@@ -39,6 +39,7 @@ function inferNormKind(type) {
     if (['ANNOTATION_TYPE', 'DECORATOR'].includes(normalized)) return 'AnnotationLike';
     if (normalized === 'STATEMENT') return 'Statement';
     if (normalized === 'EXTERNAL_API') return 'ExternalApi';
+    if (normalized === 'GATEWAY_ROUTE') return 'GatewayRoute';
     return 'CodeElement';
 }
 
@@ -47,6 +48,7 @@ function inferRelNormKind(type) {
     if (['CONTAINS', 'SOURCE_FILE'].includes(normalized)) return 'Contains';
     if (normalized === 'CALLS') return 'Calls';
     if (normalized === 'CALLS_EXTERNAL') return 'ExternalCall';
+    if (normalized === 'ROUTES_TO') return 'Routing';
     if (['IMPORTS', 'EXPORTS', 'PROP_DEPENDENCY', 'DELEGATES_TO'].includes(normalized)) return 'DependsOn';
     if (['EXTENDS', 'IMPLEMENTS', 'OVERRIDES', 'SEALED_SUBTYPE', 'COMPANION_OF', 'EXTENSION_OF'].includes(normalized)) return 'TypeRelation';
     if (['RENDERS', 'USES_HOOK'].includes(normalized)) return 'UsesUi';
@@ -86,6 +88,9 @@ class KuzuStore {
         // Created before the relationship tables that reference it. Schema is shared with the Java indexer.
         await this._query(`CREATE NODE TABLE IF NOT EXISTS ExternalApi (id STRING, name STRING, qualifiedName STRING, httpMethod STRING, url STRING, host STRING, client STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))`);
 
+        // Shared with the Java indexer: IBM DataPower gateway routing rules that forward to a final ExternalApi.
+        await this._query(`CREATE NODE TABLE IF NOT EXISTS GatewayRoute (id STRING, name STRING, qualifiedName STRING, gateway STRING, mechanism STRING, matchMethod STRING, matchPath STRING, matchHost STRING, matchCondition STRING, targetUrl STRING, targetMethod STRING, targetHost STRING, filePath STRING, lineNumber INT64, confidence DOUBLE, reason STRING, language STRING, kind STRING, normKind STRING, PRIMARY KEY(id))`);
+
         const relDefs = [
             "CREATE REL TABLE IF NOT EXISTS CONTAINS (FROM Package TO Class, FROM Package TO Interface, FROM Package TO Enum, FROM Package TO Record, FROM Class TO Method, FROM Class TO Constructor, FROM Class TO Field, FROM Interface TO Method, FROM Interface TO Field, FROM Module TO Function, FROM Module TO ArrowFunction, FROM Module TO Component, FROM Module TO Hook, FROM Module TO Class, FROM Class TO Function, FROM Class TO ArrowFunction, FROM DataClass TO Method, FROM DataClass TO Property, FROM SealedClass TO Method, FROM SealedClass TO Property, FROM ObjectDecl TO Method, FROM ObjectDecl TO Property, FROM CompanionObject TO Method, FROM CompanionObject TO Property, FROM Class TO Property, FROM Class TO InitBlock, FROM Package TO TypeAlias, FROM Package TO ObjectDecl)",
             "CREATE REL TABLE IF NOT EXISTS EXTENDS (FROM Class TO Class, FROM Interface TO Interface, FROM Component TO Class, FROM DataClass TO Class, FROM SealedClass TO Class)",
@@ -113,6 +118,7 @@ class KuzuStore {
             "CREATE REL TABLE IF NOT EXISTS SEALED_SUBTYPE (FROM SealedClass TO Class, FROM SealedClass TO DataClass, FROM SealedClass TO ObjectDecl, FROM SealedInterface TO Class, FROM SealedInterface TO Interface)",
             "CREATE REL TABLE IF NOT EXISTS COMPANION_OF (FROM CompanionObject TO Class, FROM CompanionObject TO DataClass, FROM CompanionObject TO SealedClass)",
             "CREATE REL TABLE IF NOT EXISTS SUSPENDS (FROM SuspendFunction TO SuspendFunction, FROM SuspendFunction TO Method)",
+            "CREATE REL TABLE IF NOT EXISTS ROUTES_TO (FROM GatewayRoute TO ExternalApi, confidence DOUBLE, reason STRING)",
             "CREATE REL TABLE IF NOT EXISTS CALLS_EXTERNAL (FROM Method TO ExternalApi, FROM Constructor TO ExternalApi, FROM Function TO ExternalApi, FROM AsyncFunction TO ExternalApi, FROM ArrowFunction TO ExternalApi, FROM ExtensionFunction TO ExternalApi, FROM SuspendFunction TO ExternalApi, FROM Lambda TO ExternalApi, FROM InitBlock TO ExternalApi, FROM Module TO ExternalApi, FROM Property TO ExternalApi, FROM Component TO ExternalApi, FROM Hook TO ExternalApi, FROM Generator TO ExternalApi, FROM Class TO ExternalApi, lineNumber INT64, client STRING, confidence DOUBLE, reason STRING, requestType STRING, responseType STRING, params STRING, requestHeaders STRING)"
         ];
 
@@ -129,7 +135,7 @@ class KuzuStore {
             'IMPORTS', 'EXPORTS', 'RENDERS', 'USES_HOOK', 'PROP_DEPENDENCY',
             'DECORATES', 'YIELDS',
             'EXTENSION_OF', 'DELEGATES_TO', 'SEALED_SUBTYPE', 'COMPANION_OF', 'SUSPENDS',
-            'CALLS_EXTERNAL'
+            'CALLS_EXTERNAL', 'ROUTES_TO'
         ];
         for (const r of relTypes) {
             await this._query(`DROP TABLE ${r}`);
@@ -141,7 +147,7 @@ class KuzuStore {
             'Decorator', 'Generator', 'AsyncFunction', 'Comprehension',
             'DataClass', 'SealedClass', 'SealedInterface', 'ObjectDecl',
             'CompanionObject', 'ExtensionFunction', 'SuspendFunction',
-            'Property', 'Lambda', 'InitBlock', 'TypeAlias', 'ExternalApi'
+            'Property', 'Lambda', 'InitBlock', 'TypeAlias', 'ExternalApi', 'GatewayRoute'
         ];
         for (const t of nodeTypes) {
             await this._query(`DROP TABLE ${t}`);
@@ -167,7 +173,7 @@ class KuzuStore {
                 normKind: node.properties?.normKind || inferNormKind(node.type),
             };
             for (const [key, val] of Object.entries(props)) {
-                if (['visibility', 'isAbstract', 'isStatic', 'isFinal', 'returnType', 'lineNumber', 'endLineNumber', 'statementType', 'code', 'type', 'external', 'path', 'language', 'kind', 'normKind', 'httpMethod', 'url', 'host', 'client'].includes(key)) {
+                if (['visibility', 'isAbstract', 'isStatic', 'isFinal', 'returnType', 'lineNumber', 'endLineNumber', 'statementType', 'code', 'type', 'external', 'path', 'language', 'kind', 'normKind', 'httpMethod', 'url', 'host', 'client', 'gateway', 'mechanism', 'matchMethod', 'matchPath', 'matchHost', 'matchCondition', 'targetUrl', 'targetMethod', 'targetHost', 'filePath', 'confidence', 'reason'].includes(key)) {
                     if (typeof val === 'boolean') cypher += `, ${key}: ${val}`;
                     else if (typeof val === 'number') cypher += `, ${key}: ${val}`;
                     else cypher += `, ${key}: '${escaped(String(val))}'`;
@@ -343,7 +349,7 @@ function nodeTypeToTable(type) {
         'COMPONENT': 'Component', 'HOOK': 'Hook', 'JSX_ELEMENT': 'JSXElement',
         'DECORATOR': 'Decorator', 'GENERATOR': 'Generator',
         'ASYNC_FUNCTION': 'AsyncFunction', 'COMPREHENSION': 'Comprehension',
-        'EXTERNAL_API': 'ExternalApi',
+        'EXTERNAL_API': 'ExternalApi', 'GATEWAY_ROUTE': 'GatewayRoute',
     };
     return map[type.toUpperCase()] || type;
 }
